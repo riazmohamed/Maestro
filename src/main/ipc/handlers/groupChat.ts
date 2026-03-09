@@ -61,7 +61,7 @@ import {
 } from '../../group-chat/group-chat-agent';
 
 // Group chat router imports
-import { routeUserMessage } from '../../group-chat/group-chat-router';
+import { routeUserMessage, clearPendingParticipants } from '../../group-chat/group-chat-router';
 
 // Agent detector import
 import { AgentDetector } from '../../agents';
@@ -477,6 +477,11 @@ export function registerGroupChatHandlers(deps: GroupChatHandlerDependencies): v
 			await killModerator(id, processManager ?? undefined);
 			await clearAllParticipantSessions(id, processManager ?? undefined);
 
+			// Clear pending participant tracking so next round starts clean.
+			// Without this, a subsequent user message would inherit the old pending Set
+			// and trigger synthesis prematurely when those (now-dead) processes "respond".
+			clearPendingParticipants(id);
+
 			// Load participants to emit idle states for each
 			const chat = await loadGroupChat(id);
 			if (chat) {
@@ -505,13 +510,30 @@ export function registerGroupChatHandlers(deps: GroupChatHandlerDependencies): v
 					LOG_CONTEXT
 				);
 				const processManager = getProcessManager();
-				const { routeAgentResponse } = await import('../../group-chat/group-chat-router');
+				const { routeAgentResponse, markParticipantResponded, spawnModeratorSynthesis } =
+					await import('../../group-chat/group-chat-router');
+
+				// Log the autorun summary as the participant's response
 				await routeAgentResponse(
 					groupChatId,
 					participantName,
 					summary,
 					processManager ?? undefined
 				);
+
+				// Mark participant as done and trigger synthesis if all participants have responded.
+				// Unlike regular participants (whose process exit triggers this via exit-listener),
+				// autorun participants never exit a group-chat process — the batch runs as a separate
+				// Maestro session — so we must call markParticipantResponded here.
+				const agentDetector = getAgentDetector();
+				const isLast = markParticipantResponded(groupChatId, participantName);
+				if (isLast && processManager && agentDetector) {
+					logger.info(
+						`All participants responded after autorun, spawning synthesis for ${groupChatId}`,
+						LOG_CONTEXT
+					);
+					await spawnModeratorSynthesis(groupChatId, processManager, agentDetector);
+				}
 			}
 		)
 	);

@@ -46,7 +46,6 @@ Your role is to:
 
 - When the user sends `!commit`, instruct ALL participating agents to:
   1. Commit all staged and unstaged changes on their current branch with a descriptive commit message
-  2. If the agent is working in a git worktree, remove the worktree (`git worktree remove <path>`) and then checkout the feature branch in the main repository so the user can run it locally
 - @mention each agent with clear, specific instructions
 - After all agents respond, provide a summary with each agent's branch name and commit status
 - If an agent reports conflicts or errors, relay them clearly to the user

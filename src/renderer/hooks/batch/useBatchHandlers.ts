@@ -464,7 +464,8 @@ export function useBatchHandlers(deps: UseBatchHandlersDeps): UseBatchHandlersRe
 				}, 2000);
 			}
 
-			// Group chat !autorun completion: notify the main process so the synthesis round fires
+			// Group chat !autorun completion: notify the main process so the synthesis round fires.
+			// This MUST succeed for the moderator to receive the result and continue the conversation.
 			const gcAutoRun = consumeGroupChatAutoRun(info.sessionId);
 			if (gcAutoRun) {
 				const summary = info.wasStopped
@@ -474,6 +475,13 @@ export function useBatchHandlers(deps: UseBatchHandlersDeps): UseBatchHandlersRe
 					.reportAutoRunComplete(gcAutoRun.groupChatId, gcAutoRun.participantName, summary)
 					.catch((err) => {
 						console.error('[GroupChat] Failed to report auto run complete:', err);
+						// Surface the failure so the user knows synthesis will not trigger automatically.
+						notifyToast({
+							type: 'error',
+							title: 'Group Chat Auto Run',
+							message: `Failed to notify the group chat that Auto Run finished for ${gcAutoRun.participantName}. The moderator may not receive the results automatically.`,
+							duration: 8000,
+						});
 					});
 			}
 		},

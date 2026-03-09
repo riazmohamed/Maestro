@@ -74,8 +74,6 @@ export interface SessionInfo {
 	};
 	/** Auto Run folder path for this session */
 	autoRunFolderPath?: string;
-	/** Base directory for git worktrees (configured in agent settings) */
-	worktreeBasePath?: string;
 }
 
 /**
@@ -114,6 +112,90 @@ let sshStore: SshRemoteSettingsStore | null = null;
 const pendingParticipantResponses = new Map<string, Set<string>>();
 
 /**
+ * Tracks per-participant response timeout handles.
+ * Maps `${groupChatId}:${participantName}` -> NodeJS.Timeout
+ * Timeouts fire if a participant never responds (hung process, lost IPC, etc.)
+ */
+const participantTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
+
+/** How long to wait for a participant before treating them as timed-out (10 minutes). */
+const PARTICIPANT_RESPONSE_TIMEOUT_MS = 10 * 60 * 1000;
+
+function getParticipantTimeoutKey(groupChatId: string, participantName: string): string {
+	return `${groupChatId}:${participantName}`;
+}
+
+/**
+ * Registers a response timeout for a participant.
+ * If the participant doesn't respond in PARTICIPANT_RESPONSE_TIMEOUT_MS, they are
+ * force-marked as responded so synthesis can proceed and the chat doesn't hang forever.
+ */
+function setParticipantResponseTimeout(
+	groupChatId: string,
+	participantName: string,
+	processManager: IProcessManager | undefined,
+	agentDetector: AgentDetector | undefined
+): void {
+	const key = getParticipantTimeoutKey(groupChatId, participantName);
+	// Clear any existing timeout for this participant
+	const existing = participantTimeouts.get(key);
+	if (existing) clearTimeout(existing);
+
+	const handle = setTimeout(async () => {
+		participantTimeouts.delete(key);
+		const pending = pendingParticipantResponses.get(groupChatId);
+		if (!pending?.has(participantName)) return; // Already responded
+
+		console.warn(
+			`[GroupChat:Debug] Participant ${participantName} timed out after ${PARTICIPANT_RESPONSE_TIMEOUT_MS / 1000}s — force-completing`
+		);
+		groupChatEmitters.emitMessage?.(groupChatId, {
+			timestamp: new Date().toISOString(),
+			from: 'system',
+			content: `⚠️ @${participantName} did not respond within ${PARTICIPANT_RESPONSE_TIMEOUT_MS / 60000} minutes and has been marked as timed out.`,
+		});
+
+		// Log a timeout response so the moderator knows what happened
+		try {
+			const { loadGroupChat } = await import('./group-chat-storage');
+			const { appendToLog } = await import('./group-chat-log');
+			const chat = await loadGroupChat(groupChatId);
+			if (chat) {
+				await appendToLog(
+					chat.logPath,
+					participantName,
+					`[Timed out — no response after ${PARTICIPANT_RESPONSE_TIMEOUT_MS / 60000} minutes]`
+				);
+			}
+		} catch {
+			// Non-critical — synthesize anyway
+		}
+
+		const isLast = markParticipantResponded(groupChatId, participantName);
+		if (isLast && processManager && agentDetector) {
+			spawnModeratorSynthesis(groupChatId, processManager, agentDetector).catch((err) => {
+				console.error('[GroupChat:Debug] Synthesis after timeout failed:', err);
+				groupChatEmitters.emitStateChange?.(groupChatId, 'idle');
+			});
+		}
+	}, PARTICIPANT_RESPONSE_TIMEOUT_MS);
+
+	participantTimeouts.set(key, handle);
+}
+
+/**
+ * Cancels the response timeout for a participant (called when they do respond).
+ */
+function clearParticipantResponseTimeout(groupChatId: string, participantName: string): void {
+	const key = getParticipantTimeoutKey(groupChatId, participantName);
+	const handle = participantTimeouts.get(key);
+	if (handle) {
+		clearTimeout(handle);
+		participantTimeouts.delete(key);
+	}
+}
+
+/**
  * Tracks read-only mode state for each group chat.
  * Set when user sends a message with readOnly flag, cleared on next non-readOnly message.
  * Maps groupChatId -> boolean
@@ -142,17 +224,26 @@ export function getPendingParticipants(groupChatId: string): Set<string> {
 }
 
 /**
- * Clears all pending participants for a group chat.
+ * Clears all pending participants for a group chat (and their timeouts).
  */
 export function clearPendingParticipants(groupChatId: string): void {
+	// Cancel all timeouts for this chat before clearing
+	const pending = pendingParticipantResponses.get(groupChatId);
+	if (pending) {
+		for (const name of pending) {
+			clearParticipantResponseTimeout(groupChatId, name);
+		}
+	}
 	pendingParticipantResponses.delete(groupChatId);
 }
 
 /**
- * Marks a participant as having responded (removes from pending).
+ * Marks a participant as having responded (removes from pending, cancels timeout).
  * Returns true if this was the last pending participant.
  */
 export function markParticipantResponded(groupChatId: string, participantName: string): boolean {
+	clearParticipantResponseTimeout(groupChatId, participantName);
+
 	const pending = pendingParticipantResponses.get(groupChatId);
 	if (!pending) return false;
 
@@ -476,18 +567,11 @@ export async function routeUserMessage(
 
 			// Build participant context
 			// Use normalized names (spaces → hyphens) so moderator can @mention them properly
-			const sessionsList = getSessionsCallback?.() || [];
 			const participantContext =
 				chat.participants.length > 0
 					? chat.participants
 							.map((p) => {
-								const matchingSession = sessionsList.find(
-									(s) => mentionMatches(s.name, p.name) || s.name === p.name
-								);
-								const worktreeNote = matchingSession?.worktreeBasePath
-									? ` [worktree base: ${matchingSession.worktreeBasePath}]`
-									: '';
-								return `- @${normalizeMentionName(p.name)} (${p.agentId} session)${worktreeNote}`;
+								return `- @${normalizeMentionName(p.name)} (${p.agentId} session)`;
 							})
 							.join('\n')
 					: '(No agents currently in this group chat)';
@@ -988,16 +1072,12 @@ export async function routeModeratorResponse(
 			// Get the group chat folder path for file access permissions
 			const groupChatFolder = getGroupChatDir(groupChatId);
 
-			const worktreeSection = matchingSession?.worktreeBasePath
-				? `## Git Worktree\n\nYour configured worktree base directory is: ${matchingSession.worktreeBasePath}\nCreate your git worktree under this directory.\n\n`
-				: '';
-
 			const participantPrompt = groupChatParticipantRequestPrompt
 				.replace(/\{\{PARTICIPANT_NAME\}\}/g, participantName)
 				.replace(/\{\{GROUP_CHAT_NAME\}\}/g, updatedChat.name)
 				.replace(/\{\{READ_ONLY_NOTE\}\}/g, readOnlyNote)
 				.replace(/\{\{GROUP_CHAT_FOLDER\}\}/g, groupChatFolder)
-				.replace(/\{\{WORKTREE_BASE_PATH\}\}/g, worktreeSection)
+				.replace(/\{\{WORKTREE_BASE_PATH\}\}/g, '')
 				.replace(/\{\{HISTORY_CONTEXT\}\}/g, historyContext)
 				.replace(/\{\{READ_ONLY_LABEL\}\}/g, readOnlyLabel)
 				.replace(/\{\{MESSAGE\}\}/g, message)
@@ -1154,12 +1234,22 @@ export async function routeModeratorResponse(
 		powerManager.removeBlockReason(`groupchat:${groupChatId}`);
 	}
 
-	// Store pending participants for synthesis tracking
+	// Store pending participants for synthesis tracking and install response timeouts
 	if (participantsToRespond.size > 0) {
 		pendingParticipantResponses.set(groupChatId, participantsToRespond);
 		console.log(
 			`[GroupChat:Debug] Waiting for ${participantsToRespond.size} participant(s) to respond: ${[...participantsToRespond].join(', ')}`
 		);
+		// Install a per-participant timeout so a hung/unresponsive participant can't block
+		// synthesis indefinitely. The timeout fires after PARTICIPANT_RESPONSE_TIMEOUT_MS.
+		for (const participantName of participantsToRespond) {
+			setParticipantResponseTimeout(
+				groupChatId,
+				participantName,
+				processManager ?? undefined,
+				agentDetector ?? undefined
+			);
+		}
 		// Set state to show agents are working
 		groupChatEmitters.emitStateChange?.(groupChatId, 'agent-working');
 		console.log(`[GroupChat:Debug] Emitted state change: agent-working`);
@@ -1374,18 +1464,11 @@ export async function spawnModeratorSynthesis(
 
 	// Build participant context for potential follow-up @mentions
 	// Use normalized names (spaces → hyphens) so moderator can @mention them properly
-	const synthSessionsList = getSessionsCallback?.() || [];
 	const participantContext =
 		chat.participants.length > 0
 			? chat.participants
 					.map((p) => {
-						const matchingSession = synthSessionsList.find(
-							(s) => mentionMatches(s.name, p.name) || s.name === p.name
-						);
-						const worktreeNote = matchingSession?.worktreeBasePath
-							? ` [worktree base: ${matchingSession.worktreeBasePath}]`
-							: '';
-						return `- @${normalizeMentionName(p.name)} (${p.agentId} session)${worktreeNote}`;
+						return `- @${normalizeMentionName(p.name)} (${p.agentId} session)`;
 					})
 					.join('\n')
 			: '(No agents currently in this group chat)';
@@ -1567,16 +1650,12 @@ export async function respawnParticipantWithRecovery(
 	const groupChatFolder = getGroupChatDir(groupChatId);
 
 	// Build the recovery prompt - includes standard prompt plus recovery context
-	const recoveryWorktreeSection = matchingSession?.worktreeBasePath
-		? `## Git Worktree\n\nYour configured worktree base directory is: ${matchingSession.worktreeBasePath}\nCreate your git worktree under this directory.\n\n`
-		: '';
-
 	const basePrompt = groupChatParticipantRequestPrompt
 		.replace(/\{\{PARTICIPANT_NAME\}\}/g, participantName)
 		.replace(/\{\{GROUP_CHAT_NAME\}\}/g, chat.name)
 		.replace(/\{\{READ_ONLY_NOTE\}\}/g, readOnlyNote)
 		.replace(/\{\{GROUP_CHAT_FOLDER\}\}/g, groupChatFolder)
-		.replace(/\{\{WORKTREE_BASE_PATH\}\}/g, recoveryWorktreeSection)
+		.replace(/\{\{WORKTREE_BASE_PATH\}\}/g, '')
 		.replace(/\{\{HISTORY_CONTEXT\}\}/g, historyContext)
 		.replace(/\{\{READ_ONLY_LABEL\}\}/g, readOnlyLabel)
 		.replace(

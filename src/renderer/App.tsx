@@ -1231,45 +1231,64 @@ function MaestroConsoleInner() {
 	useEffect(() => {
 		const unsub = window.maestro.groupChat.onAutoRunTriggered?.(
 			(groupChatId, participantName, targetFilename) => {
+				// Helper: report failure back to the group chat as a system message so the
+				// moderator and user can see what went wrong and take corrective action.
+				const reportFailure = (reason: string) => {
+					console.warn(`[GroupChat:AutoRun] ${reason}`);
+					window.maestro.groupChat
+						.reportAutoRunComplete(
+							groupChatId,
+							participantName,
+							`⚠️ Auto Run could not start for @${participantName}: ${reason}`
+						)
+						.catch((e) =>
+							console.error('[GroupChat:AutoRun] Failed to report failure to moderator:', e)
+						);
+				};
+
 				const sessions = useSessionStore.getState().sessions;
 				const session = sessions.find((s) => s.name === participantName);
 				if (!session) {
-					console.warn(
-						`[GroupChat:AutoRun] No session found for participant "${participantName}" — cannot start batch run`
+					reportFailure(
+						`No Maestro agent named "${participantName}" found. Make sure the agent exists and is open.`
 					);
 					return;
 				}
 				if (!session.autoRunFolderPath) {
-					console.warn(
-						`[GroupChat:AutoRun] Session "${participantName}" has no autoRunFolderPath — cannot start batch run`
+					reportFailure(
+						`Agent "${participantName}" has no Auto Run folder configured. Open the agent, go to the Auto Run tab, and configure a folder first.`
 					);
 					return;
 				}
+
 				// Fetch the document list, then start the batch run
 				window.maestro.autorun
 					.listDocs(session.autoRunFolderPath, session.sshRemoteId || undefined)
 					.then((result) => {
 						const allFiles = result.files || [];
 						if (allFiles.length === 0) {
-							console.warn(
-								`[GroupChat:AutoRun] No Auto Run documents found for "${participantName}" in ${session.autoRunFolderPath}`
+							reportFailure(
+								`No Auto Run documents found in "${session.autoRunFolderPath}". Create a document in the Auto Run tab first.`
 							);
 							return;
 						}
 
 						// If a specific filename was given (e.g. !autorun @Agent:plan.md), run only that doc.
 						// Otherwise run all docs in the folder.
-						const files =
-							targetFilename && allFiles.includes(targetFilename)
-								? [targetFilename]
-								: targetFilename
-									? (() => {
-											console.warn(
-												`[GroupChat:AutoRun] Specified file "${targetFilename}" not found in Auto Run folder for "${participantName}" — running all docs`
-											);
-											return allFiles;
-										})()
-									: allFiles;
+						let files: string[];
+						if (targetFilename) {
+							if (allFiles.includes(targetFilename)) {
+								files = [targetFilename];
+							} else {
+								// Specified file not found — fall back to all docs but warn the moderator
+								console.warn(
+									`[GroupChat:AutoRun] Specified file "${targetFilename}" not found for "${participantName}" — running all docs`
+								);
+								files = allFiles;
+							}
+						} else {
+							files = allFiles;
+						}
 
 						const documents = files.map((filename, i) => ({
 							id: `${session.id}-${i}`,
@@ -1283,12 +1302,12 @@ function MaestroConsoleInner() {
 							loopEnabled: false,
 							maxLoops: null,
 						};
-						// Register the context so useBatchHandlers.onComplete can notify synthesis
+						// Register AFTER validating docs exist so no stale entry on failure
 						registerGroupChatAutoRun(session.id, groupChatId, participantName);
 						startBatchRunRef.current(session.id, config, session.autoRunFolderPath!);
 					})
 					.catch((err) => {
-						console.error(`[GroupChat:AutoRun] Failed to list docs for "${participantName}":`, err);
+						reportFailure(`Failed to read Auto Run folder: ${String(err)}`);
 					});
 			}
 		);

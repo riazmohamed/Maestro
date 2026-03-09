@@ -243,6 +243,13 @@ export function setupExitListener(
 							error: String(err),
 							groupChatId,
 						});
+						// Reset to idle so user is not stuck waiting indefinitely
+						groupChatEmitters.emitStateChange?.(groupChatId, 'idle');
+						groupChatEmitters.emitMessage?.(groupChatId, {
+							timestamp: new Date().toISOString(),
+							from: 'system',
+							content: `⚠️ Synthesis failed: ${String(err)}. You can send another message to continue.`,
+						});
 					});
 				} else if (!isLastParticipant) {
 					// More participants pending
