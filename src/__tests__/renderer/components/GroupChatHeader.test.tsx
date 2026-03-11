@@ -24,6 +24,11 @@ vi.mock('lucide-react', () => ({
 			$
 		</span>
 	),
+	StopCircle: ({ className }: { className?: string }) => (
+		<span data-testid="stop-circle-icon" className={className}>
+			⏹
+		</span>
+	),
 }));
 
 const mockTheme = {

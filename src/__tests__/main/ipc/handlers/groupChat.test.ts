@@ -169,6 +169,8 @@ describe('groupChat IPC handlers', () => {
 				'groupChat:startModerator',
 				'groupChat:sendToModerator',
 				'groupChat:stopModerator',
+				'groupChat:stopAll',
+				'groupChat:reportAutoRunComplete',
 				'groupChat:getModeratorSessionId',
 				// Participant handlers
 				'groupChat:addParticipant',
