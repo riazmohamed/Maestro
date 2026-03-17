@@ -456,6 +456,7 @@ function setupIpcHandlers() {
 			webServer = server;
 		},
 		createWebServer,
+		settingsStore: store,
 	});
 
 	// Git operations - extracted to src/main/ipc/handlers/git.ts
